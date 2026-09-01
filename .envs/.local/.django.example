@@ -1,0 +1,19 @@
+# General
+# ------------------------------------------------------------------------------
+USE_DOCKER=yes
+IPYTHONDIR=/app/.ipython
+# Redis
+# ------------------------------------------------------------------------------
+REDIS_URL=redis://redis:6379/0
+
+# Celery
+# ------------------------------------------------------------------------------
+
+# Flower
+CELERY_FLOWER_USER=debug
+CELERY_FLOWER_PASSWORD=debug
+
+# LangChain / Gemini — get a key from https://aistudio.google.com/apikey
+# Restart Django after changing this: docker compose -f docker-compose.local.yml restart django
+GOOGLE_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
