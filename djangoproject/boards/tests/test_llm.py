@@ -2,8 +2,11 @@ from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.messages import ToolMessage
+from langchain_core.outputs import ChatGeneration
+from langchain_core.outputs import ChatResult
 
 from djangoproject.boards.llm import parse_proposed_tasks
 from djangoproject.boards.llm import run_board_chat_stream
@@ -16,29 +19,44 @@ from djangoproject.boards.tests.factories import WorkspaceFactory
 pytestmark = pytest.mark.django_db
 
 
-class _FakeToolModel:
-    def bind_tools(self, _tools):
+class FakeBoardLLM(BaseChatModel):
+    """Minimal chat model so LangGraph (or the bind_tools fallback) can run tools."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
         return self
 
-    def stream(self, messages):
-        if messages and isinstance(messages[-1], ToolMessage):
-            yield AIMessage(content="Added the card.")
-            return
-        yield AIMessage(
-            content="",
-            tool_calls=[
-                {
-                    "name": "create_task",
-                    "args": {"title": "From agent", "status": "todo"},
-                    "id": "call_1",
-                },
-            ],
-        )
+    @property
+    def _llm_type(self) -> str:
+        return "fake-board"
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        last = messages[-1] if messages else None
+        if isinstance(last, ToolMessage):
+            message = AIMessage(content="Added **From agent** as `#1`.")
+        else:
+            message = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "create_task",
+                        "args": {"title": "From agent", "status": "todo"},
+                        "id": "call_1",
+                        "type": "tool_call",
+                    },
+                ],
+            )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def stream(self, messages, **kwargs):
+        result = self._generate(messages)
+        yield result.generations[0].message
 
 
 @patch("djangoproject.boards.llm.build_chat_model")
+@pytest.mark.django_db(transaction=True)
 def test_stream_runs_create_task_tool(mock_build, user):
-    mock_build.return_value = _FakeToolModel()
+    mock_build.return_value = FakeBoardLLM()
     workspace = WorkspaceFactory.create(owner=user)
     project = ProjectFactory.create(workspace=workspace)
 
@@ -47,7 +65,7 @@ def test_stream_runs_create_task_tool(mock_build, user):
             user=user,
             user_message="add From agent",
             history=[],
-            board_context="(test)",
+            project_brief="(test)",
             project_id=project.pk,
         ),
     )
@@ -57,6 +75,8 @@ def test_stream_runs_create_task_tool(mock_build, user):
     assert "tool" in kinds
     assert kinds[-1] == "done"
     assert events[-1]["reply"]["board_changed"] is True
+    tool_event = next(event for event in events if event["type"] == "tool")
+    assert tool_event["label"]
 
 
 @patch("djangoproject.boards.llm.build_chat_model")

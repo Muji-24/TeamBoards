@@ -115,13 +115,18 @@ export class ApiError extends Error {
 
 export type ChatStreamEvent =
   | { type: "token"; text: string }
-  | { type: "tool"; name: string; result: string }
+  | { type: "tool"; name: string; label?: string; result: string }
   | { type: "status"; text: string }
   | {
       type: "done";
       reply: { message: string; board_changed: boolean; actions: string[] };
     }
   | { type: "error"; detail: string };
+
+export async function fetchChatHistory(projectId?: number | null) {
+  const qs = projectId ? `?project_id=${projectId}` : "";
+  return api<{ messages: { role: "human" | "ai"; content: string }[] }>(`/api/chat/${qs}`);
+}
 
 export async function streamChat(
   body: {

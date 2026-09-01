@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from dataclasses import field
 from datetime import date
 
+from django.db.models import Q
+from django.utils import timezone
 from langchain_core.tools import BaseTool
 from langchain_core.tools import tool
 
@@ -24,7 +26,10 @@ from djangoproject.boards.schemas import AddCommentInput
 from djangoproject.boards.schemas import ApplyLabelInput
 from djangoproject.boards.schemas import AssignTaskInput
 from djangoproject.boards.schemas import CreateTasksFromNotesInput
+from djangoproject.boards.schemas import GetTaskInput
 from djangoproject.boards.schemas import ListTasksInput
+from djangoproject.boards.schemas import PlanWorkInput
+from djangoproject.boards.schemas import SearchTasksInput
 from djangoproject.boards.schemas import SetDueDateInput
 from djangoproject.boards.schemas import SetPriorityInput
 from djangoproject.boards.schemas import TaskDraft
@@ -349,7 +354,133 @@ def apply_label_action(
     return summary
 
 
-def build_board_tools(
+def search_tasks_action(
+    user,
+    project_id: int | None,
+    *,
+    query: str,
+    status: str | None,
+    priority: str | None,
+) -> str:
+    project = _project_for(user, project_id)
+    if project is None:
+        return NO_PROJECT
+    tasks = (
+        Task.objects.filter(project=project)
+        .filter(Q(title__icontains=query) | Q(description__icontains=query))
+        .select_related("assignee")
+        .prefetch_related("labels")
+        .order_by("status", "id")
+    )
+    if status:
+        tasks = tasks.filter(status=status)
+    if priority:
+        tasks = tasks.filter(priority=priority)
+    matches = list(tasks[:25])
+    if not matches:
+        return f"No cards matched {query!r}."
+    return "\n".join(_format_task(task) for task in matches)
+
+
+def get_task_action(user, project_id: int | None, task_id: int) -> str:
+    task = _task_for(user, project_id, task_id)
+    if isinstance(task, str):
+        return task
+    comments = list(task.comments.select_related("author").order_by("-created_at")[:5])
+    lines = [
+        _format_task(task),
+        f"description: {task.description or '(none)'}",
+    ]
+    if comments:
+        lines.append("recent comments:")
+        for comment in reversed(comments):
+            who = comment.author.email if comment.author_id else "someone"
+            lines.append(f"- {who}: {comment.body}")
+    else:
+        lines.append("comments: none")
+    return "\n".join(lines)
+
+
+def get_board_summary_action(user, project_id: int | None) -> str:
+    project = _project_for(user, project_id)
+    if project is None:
+        return NO_PROJECT
+    tasks = Task.objects.filter(project=project)
+    today = timezone.localdate()
+    overdue = (
+        tasks.exclude(status=Task.Status.DONE)
+        .filter(due_date__lt=today)
+        .select_related("assignee")
+    )
+    todo = tasks.filter(status=Task.Status.TODO).count()
+    doing = tasks.filter(status=Task.Status.DOING).count()
+    done = tasks.filter(status=Task.Status.DONE).count()
+    unassigned = (
+        tasks.filter(assignee__isnull=True).exclude(status=Task.Status.DONE).count()
+    )
+    lines = [
+        f"Board: {project.name} (id={project.pk})",
+        f"todo={todo} doing={doing} done={done}",
+        f"unassigned open={unassigned}",
+        f"overdue={overdue.count()}",
+    ]
+    if overdue:
+        lines.append("overdue cards:")
+        lines.extend(_format_task(task) for task in overdue[:8])
+    activity = Activity.objects.filter(project=project).select_related("actor")[:6]
+    if activity:
+        lines.append("recent activity:")
+        lines.extend(f"- {item.summary}" for item in activity)
+    return "\n".join(lines)
+
+
+def list_members_action(user, project_id: int | None) -> str:
+    project = _project_for(user, project_id)
+    if project is None:
+        return NO_PROJECT
+    members = project.workspace.memberships.select_related("user").order_by(
+        "role",
+        "user__email",
+    )
+    if not members:
+        return "No members."
+    return "\n".join(f"{item.user.email} ({item.role})" for item in members)
+
+
+def plan_work_action(
+    user,
+    project_id: int | None,
+    state: ToolState,
+    *,
+    goal: str,
+    create: bool,
+) -> str:
+    project = _project_for(user, project_id)
+    if project is None:
+        return NO_PROJECT
+    from djangoproject.boards.llm import draft_work_plan  # noqa: PLC0415
+
+    snapshot = list_tasks_action(user, project_id, status=None)
+    plan = draft_work_plan(goal, snapshot)
+    if not plan.tasks:
+        return plan.rationale or "I could not propose any cards for that goal."
+    lines = [plan.rationale]
+    lines.extend(
+        f"- {draft.title} [{draft.status}] ({draft.priority})" for draft in plan.tasks
+    )
+    if not create:
+        prefix = (
+            "Proposed plan (not created yet). "
+            "Ask me to add them if this looks right.\n"
+        )
+        return prefix + "\n".join(lines)
+    created = [
+        create_task_action(user, project_id, state, draft) for draft in plan.tasks
+    ]
+    return "Created from plan:\n" + "\n".join(created)
+
+
+def build_board_tools(  # noqa: C901
     *,
     user,
     project_id: int | None,
@@ -456,9 +587,55 @@ def build_board_tools(
             label_name=label_name,
         )
 
+    @tool(args_schema=SearchTasksInput)
+    def search_tasks(
+        query: str,
+        status: str | None = None,
+        priority: str | None = None,
+    ) -> str:
+        """Search live cards by title/description instead of dumping the whole board."""
+        return search_tasks_action(
+            user,
+            project_id,
+            query=query,
+            status=status,
+            priority=priority,
+        )
+
+    @tool(args_schema=GetTaskInput)
+    def get_task(task_id: int) -> str:
+        """Load one card's description and recent comments."""
+        return get_task_action(user, project_id, task_id)
+
+    @tool
+    def get_board_summary() -> str:
+        """Live counts, overdue work, and recent activity for the open board."""
+        return get_board_summary_action(user, project_id)
+
+    @tool
+    def list_members() -> str:
+        """Workspace member emails and roles — use before assign_task."""
+        return list_members_action(user, project_id)
+
+    @tool(args_schema=PlanWorkInput)
+    def plan_work(goal: str, create: bool = False) -> str:  # noqa: FBT001, FBT002
+        """Break a goal into cards. create=true only when asked to add them."""
+        return plan_work_action(
+            user,
+            project_id,
+            state,
+            goal=goal,
+            create=create,
+        )
+
     return (
         [
+            get_board_summary,
+            search_tasks,
             list_tasks,
+            get_task,
+            list_members,
+            plan_work,
             create_task,
             update_task_status,
             create_tasks_from_notes,

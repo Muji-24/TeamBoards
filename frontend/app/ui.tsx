@@ -2,11 +2,43 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type KeyboardEvent,
+  type ReactNode,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
-import { clearSession, errorMessage, getEmail, getToken, streamChat } from "@/lib/api";
+import {
+  clearSession,
+  errorMessage,
+  fetchChatHistory,
+  getEmail,
+  getToken,
+  streamChat,
+} from "@/lib/api";
 
-type ChatTurn = { role: "human" | "ai" | "tool"; content: string };
+type ToolStep = { name: string; label: string; result: string };
+type ChatTurn =
+  | { id: string; role: "human"; content: string }
+  | { id: string; role: "ai"; content: string; tools: ToolStep[]; actions: string[] };
+
+function newId() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function ChatMarkdown({ text }: { text: string }) {
+  return (
+    <div className="md-body">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+    </div>
+  );
+}
 
 function projectIdFromPath(pathname: string): number | undefined {
   const match = pathname.match(/^\/projects\/(\d+)/);
@@ -201,40 +233,74 @@ export function ChatPanel({
   onBoardChanged?: () => void;
   onClose?: () => void;
 }) {
-  const [turns, setTurns] = useState<ChatTurn[]>([
-    {
-      role: "ai",
-      content:
-        "I can list, add, and move cards on this board. Ask what’s todo, or say “add a card: write tests”.",
-    },
-  ]);
+  const [turns, setTurns] = useState<ChatTurn[]>([]);
   const [text, setText] = useState("");
   const [pending, setPending] = useState(false);
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
+  const [loaded, setLoaded] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
+  const boxId = useId();
 
   useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
-  }, [turns, pending]);
+    let cancelled = false;
+    setLoaded(false);
+    fetchChatHistory(projectId ?? null)
+      .then((data) => {
+        if (cancelled) return;
+        setTurns(
+          data.messages
+            .filter((item) => item.content.trim())
+            .map((item) =>
+              item.role === "human"
+                ? { id: newId(), role: "human" as const, content: item.content }
+                : {
+                    id: newId(),
+                    role: "ai" as const,
+                    content: item.content,
+                    tools: [],
+                    actions: [],
+                  },
+            ),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setTurns([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoaded(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
 
-  async function onSubmit(event: FormEvent) {
-    event.preventDefault();
-    const message = text.trim();
-    if (!message) return;
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
+  }, [turns, pending, status]);
+
+  async function send(message: string) {
+    const trimmed = message.trim();
+    if (!trimmed || pending) return;
     setText("");
     setError("");
-    const history = turns
-      .filter((turn) => turn.role === "human" || turn.role === "ai")
-      .map((turn) => ({ role: turn.role as "human" | "ai", content: turn.content }));
-    setTurns((prev) => [...prev, { role: "human", content: message }, { role: "ai", content: "" }]);
+    const history = turns.map((turn) => ({
+      role: turn.role,
+      content: turn.content,
+    }));
+    const aiId = newId();
+    setTurns((prev) => [
+      ...prev,
+      { id: newId(), role: "human", content: trimmed },
+      { id: aiId, role: "ai", content: "", tools: [], actions: [] },
+    ]);
     setPending(true);
     setStatus("Working…");
     let boardChanged = false;
     try {
       await streamChat(
         {
-          message,
+          message: trimmed,
           history,
           project_id: projectId ?? null,
         },
@@ -243,34 +309,39 @@ export function ChatPanel({
             setStatus(event.text);
           } else if (event.type === "token") {
             setStatus("");
-            setTurns((prev) => {
-              const next = [...prev];
-              const last = next[next.length - 1];
-              if (last?.role === "ai") {
-                next[next.length - 1] = { ...last, content: last.content + event.text };
-              }
-              return next;
-            });
+            setTurns((prev) =>
+              prev.map((turn) =>
+                turn.id === aiId && turn.role === "ai"
+                  ? { ...turn, content: turn.content + event.text }
+                  : turn,
+              ),
+            );
           } else if (event.type === "tool") {
-            setTurns((prev) => {
-              const next = [...prev];
-              if (next[next.length - 1]?.role === "ai") {
-                next.pop();
-              }
-              next.push({ role: "tool", content: event.result });
-              next.push({ role: "ai", content: "" });
-              return next;
-            });
+            setStatus("");
+            const step: ToolStep = {
+              name: event.name,
+              label: event.label || event.name.replaceAll("_", " "),
+              result: event.result,
+            };
+            setTurns((prev) =>
+              prev.map((turn) =>
+                turn.id === aiId && turn.role === "ai"
+                  ? { ...turn, tools: [...turn.tools, step] }
+                  : turn,
+              ),
+            );
           } else if (event.type === "done") {
             boardChanged = event.reply.board_changed;
-            setTurns((prev) => {
-              const next = [...prev];
-              const last = next[next.length - 1];
-              if (last?.role === "ai" && !last.content.trim() && event.reply.message) {
-                next[next.length - 1] = { ...last, content: event.reply.message };
-              }
-              return next;
-            });
+            setTurns((prev) =>
+              prev.map((turn) => {
+                if (turn.id !== aiId || turn.role !== "ai") return turn;
+                return {
+                  ...turn,
+                  content: turn.content.trim() ? turn.content : event.reply.message,
+                  actions: event.reply.actions,
+                };
+              }),
+            );
           } else if (event.type === "error") {
             setError(event.detail);
           }
@@ -287,6 +358,24 @@ export function ChatPanel({
     }
   }
 
+  function onSubmit(event: FormEvent) {
+    event.preventDefault();
+    void send(text);
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void send(text);
+    }
+  }
+
+  const suggestions = projectId
+    ? ["What's on this board?", "What should I work on next?", "Find overdue or unassigned cards"]
+    : ["How do I use this assistant?"];
+  const last = turns[turns.length - 1];
+  const showStatus = pending && last?.role === "ai" && !last.content;
+
   return (
     <aside className="chat">
       <header>
@@ -298,39 +387,97 @@ export function ChatPanel({
         </div>
         <p>
           {projectId
-            ? "Can list, add, and move cards on this board."
-            : "Open a board to let me change tasks."}
+            ? "LangGraph agent · live board tools · markdown replies"
+            : "Open a board so I can read and change cards."}
         </p>
       </header>
       <div className="chat-log" ref={logRef}>
-        {turns.map((turn, i) =>
-          turn.role === "ai" && !turn.content && pending && i === turns.length - 1 ? (
-            <div key={`${turn.role}-${i}`} className="bubble ai muted">
-              {status || "Working…"}
+        {loaded && turns.length === 0 ? (
+          <div className="chat-welcome">
+            <p className="eyebrow">LangChain</p>
+            <h3>Ask the board, don’t guess.</h3>
+            <p>
+              I look up live cards with tools, then answer in structured markdown. Nothing is
+              hardcoded into the prompt.
+            </p>
+            <div className="chat-suggestions">
+              {suggestions.map((item) => (
+                <button key={item} type="button" className="suggest" onClick={() => void send(item)}>
+                  {item}
+                </button>
+              ))}
             </div>
-          ) : turn.role === "ai" && turn.content && pending && i === turns.length - 1 ? (
-            <div key={`${turn.role}-${i}`} className="bubble ai streaming">
+          </div>
+        ) : null}
+        {turns.map((turn) =>
+          turn.role === "human" ? (
+            <div key={turn.id} className="bubble human">
               {turn.content}
             </div>
-          ) : turn.content ? (
-            <div key={`${turn.role}-${i}`} className={`bubble ${turn.role}`}>
-              {turn.content}
+          ) : (
+            <div
+              key={turn.id}
+              className={`ai-turn${pending && turn.id === last?.id ? " streaming" : ""}`}
+            >
+              {turn.tools.length ? (
+                <ol className="tool-rail">
+                  {turn.tools.map((step, index) => (
+                    <li key={`${step.name}-${index}`} title={step.result}>
+                      {step.label}
+                    </li>
+                  ))}
+                </ol>
+              ) : null}
+              {turn.content ? <ChatMarkdown text={turn.content} /> : null}
+              {turn.actions.length ? (
+                <ul className="action-recap">
+                  {turn.actions.map((action) => (
+                    <li key={action}>{action}</li>
+                  ))}
+                </ul>
+              ) : null}
             </div>
-          ) : null,
+          ),
         )}
+        {showStatus ? (
+          <div className="ai-turn pending">
+            <span className="dots" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+            </span>
+            <span>{status || "Working…"}</span>
+          </div>
+        ) : null}
       </div>
       {error ? (
-        <p className="error" style={{ padding: "0 12px 8px" }}>
+        <p className="error" style={{ padding: "0 16px 8px" }}>
           {error}
         </p>
       ) : null}
-      <form onSubmit={onSubmit}>
-        <input
+      {loaded && turns.length > 0 && !pending ? (
+        <div className="chat-suggestions bar">
+          {suggestions.map((item) => (
+            <button key={item} type="button" className="suggest" onClick={() => void send(item)}>
+              {item}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <form className="chat-composer" onSubmit={onSubmit}>
+        <label className="sr-only" htmlFor={boxId}>
+          Message
+        </label>
+        <textarea
+          id={boxId}
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder={projectId ? "Add a card, or ask what’s done…" : "Ask about your boards…"}
+          onKeyDown={onKeyDown}
+          rows={2}
+          placeholder={projectId ? "Ask, plan, or add cards…" : "Ask about Boards…"}
+          disabled={pending}
         />
-        <button type="submit" disabled={pending}>
+        <button type="submit" disabled={pending || !text.trim()}>
           Send
         </button>
       </form>

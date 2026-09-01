@@ -82,6 +82,37 @@ class ApplyLabelInput(BaseModel):
     label_name: str = Field(description="Existing workspace label name, e.g. Bug")
 
 
+class SearchTasksInput(BaseModel):
+    query: str = Field(description="Words to match in title or description")
+    status: TaskStatusName | None = Field(
+        default=None,
+        description="Optional column filter",
+    )
+    priority: PriorityName | None = Field(
+        default=None,
+        description="Optional priority filter",
+    )
+
+
+class GetTaskInput(BaseModel):
+    task_id: int = Field(description="Numeric id of the card")
+
+
+class PlanWorkInput(BaseModel):
+    goal: str = Field(description="What the user wants to accomplish")
+    create: bool = Field(
+        default=False,
+        description="True only if the user asked to add these cards now",
+    )
+
+
+class WorkPlan(BaseModel):
+    """Nested structured output: a goal broken into cards."""
+
+    rationale: str = Field(description="Short why this breakdown")
+    tasks: list[TaskDraft] = Field(description="Proposed cards")
+
+
 class BoardReply(BaseModel):
     """Typed payload on the final SSE event so the UI can refresh the board."""
 

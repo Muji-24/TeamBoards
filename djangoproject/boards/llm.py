@@ -1,18 +1,10 @@
-"""LangChain lesson lives here — Django only *calls* this.
+"""LangGraph ReAct agent over Django-backed tools.
 
-LangChain is not the model. Gemini is the model.
-LangChain is the glue: prompts, tools, structured schemas, streaming.
+Gemini is the model. LangChain/LangGraph is the glue: prompts, tools,
+structured schemas, streaming. The agent graph decides when to call tools;
+Django still checks membership on every write.
 
-What this module does now:
-
-1. Tools — bind Python functions onto Gemini. The model may call
-   list_tasks / create_task / update_task_status. Django still checks membership.
-
-2. Streaming — llm.stream() yields tokens. The view forwards them as SSE.
-
-3. Structured output — Pydantic schemas on tools, plus
-   with_structured_output(ProposedTaskList) when extracting a pasted list.
-   BoardReply is the typed final SSE event.
+This is not a hardcoded board dump and not a fixed 5-round loop.
 """
 
 from __future__ import annotations
@@ -22,35 +14,58 @@ from typing import TYPE_CHECKING
 from typing import Any
 
 from django.conf import settings
+from langchain.agents import create_agent
 from langchain_core.messages import AIMessage
 from langchain_core.messages import BaseMessage
 from langchain_core.messages import HumanMessage
-from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from pydantic import ValidationError
 
 from djangoproject.boards.schemas import BoardReply
 from djangoproject.boards.schemas import ProposedTaskList
+from djangoproject.boards.schemas import WorkPlan
 from djangoproject.boards.tools import build_board_tools
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-MAX_TOOL_ROUNDS = 5
+    from langgraph.graph.state import CompiledStateGraph
 
-SYSTEM_PROMPT = (
-    "You are a concise assistant for a team task board. "
-    "Use tools to list, create, move, assign, label, comment on, or schedule tasks. "
-    "list_tasks shows live cards. create_task adds one card. "
-    "create_tasks_from_notes extracts several cards from a pasted list. "
-    "update_task_status moves a card; use the numeric id from list_tasks. "
-    "assign_task uses a member email. set_due_date uses YYYY-MM-DD. "
-    "set_priority is low/medium/high/urgent. apply_label uses an existing label name. "
-    "If there is no project, say they should open a board. "
-    "Keep answers short.\n\n"
-    "Board snapshot:\n{board_context}"
-)
+TOOL_LABELS = {
+    "get_board_summary": "Reading the board",
+    "search_tasks": "Searching cards",
+    "list_tasks": "Listing cards",
+    "get_task": "Opening a card",
+    "list_members": "Checking members",
+    "plan_work": "Planning work",
+    "create_task": "Creating a card",
+    "create_tasks_from_notes": "Adding cards from notes",
+    "update_task_status": "Moving a card",
+    "assign_task": "Assigning a card",
+    "set_due_date": "Setting a due date",
+    "set_priority": "Setting priority",
+    "add_comment": "Adding a comment",
+    "apply_label": "Applying a label",
+}
+
+
+def _system_prompt(project_brief: str) -> str:
+    return (
+        "You are TeamBoards' assistant — a capable copilot for a kanban board.\n"
+        f"{project_brief}\n\n"
+        "How you work:\n"
+        "- Inspect live state with tools before talking about specific cards. "
+        "Never invent task ids.\n"
+        "- Prefer get_board_summary or search_tasks over listing everything.\n"
+        "- Use plan_work to break a goal into cards. Set create=true only when "
+        "the user asked you to add them.\n"
+        "- After writes, recap what changed.\n\n"
+        "How you write (GitHub-flavored markdown):\n"
+        "- Short headings, bullets, and numbered lists.\n"
+        "- **Bold** card titles. Refer to cards as `#12`.\n"
+        "- A compact markdown table only when comparing several cards.\n"
+        "- No filler like 'Sure!' or 'As an AI'."
+    )
 
 
 class ChatNotConfigured(RuntimeError):
@@ -79,11 +94,7 @@ def build_chat_model() -> ChatGoogleGenerativeAI:
 
 
 def parse_proposed_tasks(notes: str) -> ProposedTaskList:
-    """Force Gemini to fill ProposedTaskList instead of a paragraph.
-
-    with_structured_output sends the Pydantic schema to the model and
-    returns an instance — not a string you have to regex.
-    """
+    """Force Gemini to fill ProposedTaskList instead of a paragraph."""
     llm = build_chat_model().with_structured_output(ProposedTaskList)
     result = llm.invoke(
         "Extract task cards from these notes. "
@@ -95,10 +106,23 @@ def parse_proposed_tasks(notes: str) -> ProposedTaskList:
     return ProposedTaskList.model_validate(result)
 
 
+def draft_work_plan(goal: str, board_snapshot: str) -> WorkPlan:
+    """Nested structured-output chain: a goal becomes typed TaskDrafts."""
+    llm = build_chat_model().with_structured_output(WorkPlan)
+    result = llm.invoke(
+        "Break this goal into board cards. Keep titles short. "
+        "Respect work already on the board (do not duplicate).\n\n"
+        f"Goal:\n{goal}\n\nCurrent board:\n{board_snapshot}",
+    )
+    if isinstance(result, WorkPlan):
+        return result
+    return WorkPlan.model_validate(result)
+
+
 def history_to_messages(history: list[dict]) -> list[BaseMessage]:
     """Turn JSON [{role, content}] into LangChain message objects."""
     messages: list[BaseMessage] = []
-    for item in history[-20:]:
+    for item in history[-24:]:
         role = item.get("role")
         content = item.get("content", "")
         if role == "human":
@@ -143,31 +167,82 @@ def _tool_args(call: dict) -> dict:
     return args
 
 
-def run_board_chat_stream(
+def build_board_agent(
     *,
-    user,
-    user_message: str,
-    history: list[dict],
-    board_context: str,
-    project_id: int | None,
+    model: Any,
+    tools: list,
+    project_brief: str,
+) -> CompiledStateGraph:
+    return create_agent(
+        model,
+        tools,
+        system_prompt=_system_prompt(project_brief),
+        name="board_agent",
+    )
+
+
+def _tool_event(name: str, result: str) -> dict:
+    label = TOOL_LABELS.get(name, name.replace("_", " "))
+    return {"type": "tool", "name": name, "label": label, "result": result}
+
+
+def _token_events(data: Any) -> Iterator[dict]:
+    chunk = data[0] if isinstance(data, tuple) else data
+    meta = data[1] if isinstance(data, tuple) and len(data) > 1 else {}
+    if (meta or {}).get("langgraph_node") == "tools":
+        return
+    text = _content_to_text(getattr(chunk, "content", None))
+    if text:
+        yield {"type": "token", "text": text}
+
+
+def _tool_update_events(data: dict) -> Iterator[dict]:
+    for node, update in data.items():
+        if node != "tools" or not isinstance(update, dict):
+            continue
+        yield {"type": "status", "text": "Updating the board…"}
+        for msg in update.get("messages") or []:
+            if isinstance(msg, ToolMessage):
+                name = getattr(msg, "name", "") or ""
+                result = str(getattr(msg, "content", "") or "")
+                yield _tool_event(name, result)
+
+
+def _stream_graph(
+    graph: CompiledStateGraph,
+    messages: list[BaseMessage],
 ) -> Iterator[dict]:
-    """Yield SSE-ready dicts: token, tool, then a structured done event."""
-    tools, tool_state = build_board_tools(user=user, project_id=project_id)
-    llm_with_tools = build_chat_model().bind_tools(tools)
-    tool_map = {tool.name: tool for tool in tools}
-
-    messages: list[BaseMessage] = [
-        SystemMessage(
-            content=SYSTEM_PROMPT.format(
-                board_context=board_context or "(no project loaded)",
-            ),
-        ),
-        *history_to_messages(history),
-        HumanMessage(content=user_message),
-    ]
-
+    """Yield SSE events from LangGraph message/update streams."""
     spoken = ""
-    for _ in range(MAX_TOOL_ROUNDS):
+    for item in graph.stream(
+        {"messages": messages},
+        stream_mode=["messages", "updates"],
+        config={"recursion_limit": 15},
+    ):
+        if not isinstance(item, tuple) or len(item) != 2:  # noqa: PLR2004
+            continue
+        mode, data = item
+        if mode == "messages":
+            for event in _token_events(data):
+                spoken += str(event["text"])
+                yield event
+        elif mode == "updates" and isinstance(data, dict):
+            yield from _tool_update_events(data)
+    if spoken.strip():
+        yield {"type": "_spoken", "text": spoken.strip()}
+
+
+def _stream_bind_tools_fallback(
+    *,
+    model: Any,
+    tools: list,
+    messages: list[BaseMessage],
+) -> Iterator[dict]:
+    """Used in tests (and as a safety net) when the object is not a real chat model."""
+    llm_with_tools = model.bind_tools(tools)
+    tool_map = {tool.name: tool for tool in tools}
+    spoken = ""
+    for _ in range(8):
         assembled: AIMessage | None = None
         for chunk in llm_with_tools.stream(messages):
             assembled = chunk if assembled is None else assembled + chunk
@@ -196,15 +271,56 @@ def run_board_chat_stream(
             else:
                 try:
                     result = str(tool.invoke(_tool_args(call)))
-                except (TypeError, ValueError, ValidationError) as exc:
+                except (TypeError, ValueError) as exc:
                     result = f"Tool {name} failed: {exc}"
-            yield {"type": "tool", "name": name, "result": result}
+            yield _tool_event(name, result)
             messages.append(
                 ToolMessage(
                     content=result,
                     tool_call_id=str(call.get("id") or name),
+                    name=name,
                 ),
             )
+    if spoken.strip():
+        yield {"type": "_spoken", "text": spoken.strip()}
+
+
+def run_board_chat_stream(
+    *,
+    user,
+    user_message: str,
+    history: list[dict],
+    project_brief: str,
+    project_id: int | None,
+) -> Iterator[dict]:
+    """Yield SSE-ready dicts: token, tool, then a structured done event."""
+    tools, tool_state = build_board_tools(user=user, project_id=project_id)
+    model = build_chat_model()
+    messages: list[BaseMessage] = [
+        *history_to_messages(history),
+        HumanMessage(content=user_message),
+    ]
+
+    spoken = ""
+    try:
+        graph = build_board_agent(
+            model=model,
+            tools=tools,
+            project_brief=project_brief,
+        )
+        events = _stream_graph(graph, messages)
+    except (TypeError, ValueError, AttributeError):
+        events = _stream_bind_tools_fallback(
+            model=model,
+            tools=tools,
+            messages=messages,
+        )
+
+    for event in events:
+        if event["type"] == "_spoken":
+            spoken = str(event["text"])
+            continue
+        yield event
 
     if not spoken.strip() and tool_state.actions:
         spoken = "; ".join(tool_state.actions)
@@ -223,7 +339,7 @@ def run_board_chat(
     user,
     user_message: str,
     history: list[dict],
-    board_context: str,
+    project_brief: str,
     project_id: int | None,
 ) -> str:
     """Collect a stream into one string (tests / non-streaming callers)."""
@@ -232,7 +348,7 @@ def run_board_chat(
         user=user,
         user_message=user_message,
         history=history,
-        board_context=board_context,
+        project_brief=project_brief,
         project_id=project_id,
     ):
         if event["type"] == "token":

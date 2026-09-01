@@ -275,6 +275,69 @@ def log_activity(  # noqa: PLR0913
     )
 
 
+class ChatThread(models.Model):
+    """One LangGraph conversation per user and board (or global if no board)."""
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="chat_threads",
+        verbose_name=_("User"),
+    )
+    project = models.ForeignKey(
+        Project,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="chat_threads",
+        verbose_name=_("Project"),
+    )
+    created_at = models.DateTimeField(_("Created at"), auto_now_add=True)
+    updated_at = models.DateTimeField(_("Updated at"), auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("user", "project"),
+                condition=models.Q(project__isnull=False),
+                name="boards_unique_user_project_chat",
+            ),
+            models.UniqueConstraint(
+                fields=("user",),
+                condition=models.Q(project__isnull=True),
+                name="boards_unique_user_global_chat",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        board = self.project_id or "global"
+        return f"Chat {self.user_id} / {board}"
+
+
+class ChatMessage(models.Model):
+    """Persisted human/assistant turns. Tool calls are not stored as bubbles."""
+
+    class Role(models.TextChoices):
+        HUMAN = "human", _("Human")
+        AI = "ai", _("Assistant")
+
+    thread = models.ForeignKey(
+        ChatThread,
+        on_delete=models.CASCADE,
+        related_name="messages",
+        verbose_name=_("Thread"),
+    )
+    role = models.CharField(_("Role"), max_length=8, choices=Role.choices)
+    content = models.TextField(_("Content"))
+    created_at = models.DateTimeField(_("Created at"), auto_now_add=True)
+
+    class Meta:
+        ordering = ("created_at",)
+
+    def __str__(self) -> str:
+        return f"{self.role} in thread {self.thread_id}"
+
+
 DEFAULT_LABELS = (
     ("Bug", "#e23d2a"),
     ("Feature", "#2f6fed"),

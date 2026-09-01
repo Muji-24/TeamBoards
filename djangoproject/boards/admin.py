@@ -1,6 +1,8 @@
 from django.contrib import admin
 
 from .models import Activity
+from .models import ChatMessage
+from .models import ChatThread
 from .models import Comment
 from .models import Label
 from .models import Membership
@@ -51,3 +53,16 @@ class CommentAdmin(admin.ModelAdmin):
 class ActivityAdmin(admin.ModelAdmin):
     list_display = ("summary", "verb", "workspace", "actor", "created_at")
     list_filter = ("verb", "workspace")
+
+
+class ChatMessageInline(admin.TabularInline):
+    model = ChatMessage
+    extra = 0
+    readonly_fields = ("role", "content", "created_at")
+
+
+@admin.register(ChatThread)
+class ChatThreadAdmin(admin.ModelAdmin):
+    list_display = ("user", "project", "updated_at")
+    list_filter = ("project",)
+    inlines = (ChatMessageInline,)

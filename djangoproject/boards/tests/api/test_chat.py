@@ -82,8 +82,13 @@ def test_chat_streams_reply(mock_run, user, api_client: APIClient):
     assert events[1] == {"type": "token", "text": "Summarized."}
     assert events[-1]["reply"]["message"] == "Summarized."
     kwargs = mock_run.call_args.kwargs
-    assert "Write docs" in kwargs["board_context"]
+    assert project.name in kwargs["project_brief"]
     assert kwargs["project_id"] == project.pk
+    assert "Write docs" not in kwargs["project_brief"]
+
+    stored = api_client.get("/api/chat/", {"project_id": project.pk})
+    assert stored.status_code == HTTPStatus.OK
+    assert stored.json()["messages"][-1] == {"role": "ai", "content": "Summarized."}
 
 
 def test_create_task_tool_writes_row(user):
@@ -160,3 +165,39 @@ def test_create_tasks_from_notes_uses_structured_list(mock_parse, user):
     assert state.board_changed is True
     assert "Alpha" in result
     mock_parse.assert_called_once()
+
+
+def test_search_and_summary_tools(user):
+    workspace = WorkspaceFactory.create(owner=user)
+    project = ProjectFactory.create(workspace=workspace)
+    TaskFactory.create(
+        project=project,
+        title="Write API tests",
+        description="pytest for chat",
+        created_by=user,
+    )
+    TaskFactory.create(
+        project=project,
+        title="Unrelated design",
+        created_by=user,
+    )
+    tools, _state = build_board_tools(user=user, project_id=project.pk)
+
+    found = _tool(tools, "search_tasks").invoke({"query": "pytest"})
+    assert "Write API tests" in found
+    assert "Unrelated design" not in found
+
+    summary = _tool(tools, "get_board_summary").invoke({})
+    assert project.name in summary
+    assert "todo=" in summary
+
+
+def test_chat_history_get_empty(user, api_client: APIClient):
+    workspace = WorkspaceFactory.create(owner=user)
+    project = ProjectFactory.create(workspace=workspace)
+    api_client.force_authenticate(user)
+
+    response = api_client.get("/api/chat/", {"project_id": project.pk})
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json() == {"messages": []}
