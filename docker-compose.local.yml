@@ -47,7 +47,7 @@ services:
       - "8025:8025"
 
   redis:
-    image: docker.io/redis:7.2
+    image: docker.io/redis:8.2
     container_name: djangoproject_local_redis
     volumes:
       - djangoproject_local_redis_data:/data
